@@ -3,10 +3,10 @@
 .DS_Store
 .AppleDouble
 .LSOverride
-
+.idea/*
 # Don't commit the zipfiles
 *.zip
-
+**/__pycache__
 # Don't commit my Manifests - they're confidential
 /Manifests/*
 *Manifest.yaml
