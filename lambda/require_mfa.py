@@ -28,8 +28,10 @@ def lambda_handler(event, context):
 
 def process_CreateLoginProfile(event, context):
     # Get the important bits
-    username = event['detail']['responseElements']['loginProfile']['userName']
-
+    username = event['detail']['requestParameters']['loginProfile']['userName']
+    # Exit if this is for a vault user
+    if 'vault' in username:
+        return
     # Verify there is no MFA present
     client = boto3.client('iam')
     response = client.list_mfa_devices(UserName=username)
@@ -46,8 +48,10 @@ def process_CreateLoginProfile(event, context):
 
 def process_DeleteLoginProfile(event, context):
     # Get the important bits
-    username = event['detail']['responseElements']['loginProfile']['userName']
-
+    username = event['detail']['requestParameters']['loginProfile']['userName']
+    # Skip for Vault
+    if 'vault' in username:
+        return
     # No login profile, so MFA is not required
     client = boto3.client('iam')
     remove_user_from_blackhole(username)

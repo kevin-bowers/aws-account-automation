@@ -7,30 +7,30 @@ import os
 import sys
 from time import sleep
 from botocore.exceptions import ClientError
-from require_mfa import process_CreateLoginProfile, process_DeleteLoginProfile, process_EnableMFADevice, process_DeactivateMFADevice
+from require_mfa import process_CreateLoginProfile, process_DeleteLoginProfile, process_EnableMFADevice, \
+    process_DeactivateMFADevice
 
 # These should be passed in via Lambda Environment Variables
 try:
     BLACKHOLE_GROUPNAME = os.environ['BLACKHOLE_GROUPNAME']
-    # ACTION_TOPIC_ARN = os.environ['ACTION_TOPIC_ARN']
+    ACTION_TOPIC_ARN = os.environ['ACTION_TOPIC_ARN']
     GRACE_PERIOD = int(os.environ['GRACE_PERIOD'])
     DISABLE_USERS = os.environ['DISABLE_USERS']
     SEND_EMAIL = os.environ['SEND_EMAIL']
-    # FROM_ADDRESS = os.environ['FROM_ADDRESS']
-    # EXPLANATION_FOOTER = os.environ['EXPLANATION_FOOTER']
-    # EXPLANATION_HEADER = os.environ['EXPLANATION_HEADER']
 except KeyError as e:
     print("Key Error: " + str(e))
     sys.exit(1)
 
 # Define a Global String to be the report output sent to ACTION_TOPIC_ARN
-ACTION_SUMMARY = ""
-REPORT_SUMMARY = ""
-
+ACTION_SUMMARY = ''
+EXPLANATION_FOOTER = ''
+EXPLANATION_HEADER = ''
+FROM_ADDRESS = 'secureblueprint@kudelskisecurity.com'
+REPORT_SUMMARY = ''
 print('Loading function')
 
 if DISABLE_USERS == "true":
-    expired_message = "\n\tYour Password is {} days post expiration. Your permissions have been revoked. "
+    expired_message = "\n\tYour Password is {} days post expiration. You will be forced to reset it on your next login. "
     key_expired_message = "\n\tYour AccessKey ID {} is {} days post expiration. It has been deactivated. "
 else:
     expired_message = "\n\tYour Password is {} days post expiration. You must change your password or risk losing access. "
@@ -70,57 +70,69 @@ def process_UsersCron(iam_client):
         if row['password_enabled'] != "true":
             continue  # Skip IAM Users without passwords, they are service accounts
 
-        message = ""  # This is what we send to the user
+        if 'vault' in row['user']:
+            continue
 
-        if is_user_expired(row['user']) == 0:
-            # Process their password
-            password_expires = days_till_expire(row['password_last_changed'], max_age)
-            if password_expires <= 0:
-                REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Password expired {} days ago".format(row['user'],
-                                                                                               password_expires * -1)
-                message = message + expired_message.format(password_expires * -1)
-                add_user_to_blackhole(row['user'], iam_client)
-            elif password_expires < GRACE_PERIOD:
-                message = message + password_warn_message.format(password_expires)
-                REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Password Will expire in {} days".format(row['user'],
-                                                                                                  password_expires)
+        message = ""  # This is what we send to the user
+        # Process MFA Devices
+        process_mfa_devices(row['user'], iam_client)
+        # Process their password
+        password_expires = days_till_expire(row['password_last_changed'], max_age)
+        if password_expires <= 0:
+            REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Password expired {} days ago".format(row['user'],
+                                                                                           password_expires * -1)
+            message = message + expired_message.format(password_expires * -1)
+            #if not is_user_blackholed(row['user'], iam_client):
+                # add_user_to_blackhole(row['user'], iam_client)
+            if not password_reset_required(row['user'], iam_client):
+                force_password_reset(row['user'], iam_client)
+        elif password_expires < GRACE_PERIOD:
+            message = message + password_warn_message.format(password_expires)
+            REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Password Will expire in {} days".format(row['user'],
+                                                                                            password_expires)
+        if password_expires == max_age:
+            remove_user_from_blackhole(row['user'], iam_client)
+            REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s password has been updated".format(row['user'])
 
         try:
             # Process their Access Keys
             response = iam_client.list_access_keys(UserName=row['user'])
             for key in response['AccessKeyMetadata']:
-                if key['Status'] == "Inactive": continue
+                if key['Status'] == "Inactive":
+                    continue
                 key_expires = days_till_expire(key['CreateDate'], max_age)
                 if key_expires <= 0:
                     message = message + key_expired_message.format(key['AccessKeyId'], key_expires * -1)
                     disable_users_key(key['AccessKeyId'], row['user'], iam_client)
-                    REPORT_SUMMARY = REPORT_SUMMARY + "\n {}'s Key {} expired {} days ago ".format(row['user'],
+                    REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Key {} expired {} days ago ".format(row['user'],
                                                                                                    key['AccessKeyId'],
                                                                                                    key_expires * -1)
                 elif key_expires < GRACE_PERIOD:
                     message = message + key_warn_message.format(key['AccessKeyId'], key_expires)
-                    REPORT_SUMMARY = REPORT_SUMMARY + "\n {}'s Key {} will expire {} days from now ".format(row['user'],
-                                                                                                            key[
-                                                                                                                'AccessKeyId'],
+                    REPORT_SUMMARY = REPORT_SUMMARY + "\n{}'s Key {} will expire {} days from now ".format(row['user'],
+                                                                                                            key['AccessKeyId'],
                                                                                                             key_expires)
         except ClientError as e:
+            print(str(e))
             continue
 
         # Email user if necessary
         if message != "":
-            email_user(row['user'], message, account_name)
+            email_user(row['user'], message, account_name, iam_client)
 
     # All Done. Send a summary to the ACTION_TOPIC_ARN, and print one out for the Lambda Logs
     print("Action Summary:" + ACTION_SUMMARY)
-    # if ACTION_SUMMARY != "": send_summary()
+    print("Report Summary: " + REPORT_SUMMARY)
+    if ACTION_SUMMARY != "":
+        send_summary()
     # if REPORT_SUMMARY != "": email_user(FROM_ADDRESS, REPORT_SUMMARY, account_name)
     return
 
 
-def is_user_expired(username):
-    client = boto3.client('iam')
+def is_user_blackholed(username, iam_client):
+    # 0 for not-expired, 1 for expired
     try:
-        response = client.list_groups_for_user(UserName=username)
+        response = iam_client.list_groups_for_user(UserName=username)
     except ClientError as e:
         return 1
 
@@ -130,26 +142,35 @@ def is_user_expired(username):
     return 0
 
 
-def email_user(email, message, account_name):
+def password_reset_required(user, iam_client):
+    login_profile = iam_client.get_login_profile(UserName=user)
+    return login_profile['LoginProfile']['PasswordResetRequired']
+
+
+def email_user(email, message, account_name, iam_client):
     global ACTION_SUMMARY  # This is what we send to the admins
-    if SEND_EMAIL != "true": return  # Abort if we're not supposed to send email
-    if message == "": return  # Don't send an empty message
+    if SEND_EMAIL != "true":
+        return  # Abort if we're not supposed to send email
+    if message == "":
+        return  # Don't send an empty message
     client = boto3.client('ses')
     body = EXPLANATION_HEADER + "\n" + message + "\n\n" + EXPLANATION_FOOTER
-    try:
-        response = client.send_email(
-            Source=FROM_ADDRESS,
-            Destination={'ToAddresses': [email]},
-            Message={
-                'Subject': {'Data': email_subject.format(account_name)},
-                'Body': {'Text': {'Data': body}}
-            }
-        )
-        ACTION_SUMMARY = ACTION_SUMMARY + "\nEmail Sent to {}".format(email)
-        return
-    except ClientError as e:
-        print("Failed to send message to {}: {}".format(email, e.message))
-        ACTION_SUMMARY = ACTION_SUMMARY + "\nERROR: Message to {} was rejected: {}".format(email, e.message)
+    email = get_user_email_from_tag(iam_client=iam_client, user=email)
+    if email:
+        try:
+            response = client.send_email(
+                Source=FROM_ADDRESS,
+                Destination={'ToAddresses': [email]},
+                Message={
+                    'Subject': {'Data': email_subject.format(account_name)},
+                    'Body': {'Text': {'Data': body}}
+                }
+            )
+            ACTION_SUMMARY = ACTION_SUMMARY + "\nEmail Sent to {}".format(email)
+            return
+        except ClientError as e:
+            print("Failed to send message to {}: {}".format(email, e.message))
+            ACTION_SUMMARY = ACTION_SUMMARY + "\nERROR: Message to {} was rejected: {}".format(email, e.message)
 
 
 def days_till_expire(last_changed, max_age):
@@ -188,6 +209,13 @@ def get_credential_report(iam_client):
         return get_credential_report(iam_client)
 
 
+def get_user_email_from_tag(iam_client, user):
+    user_tags = iam_client.list_user_tags(UserName=user)
+    email_tag = [tag for tag in user_tags['Tags'] if tag['Key'] == 'email']
+    if email_tag:
+        return email_tag[0]['Value']
+
+
 # Query the account's password policy for the password age. Return that number of days
 def get_max_password_age(iam_client):
     try:
@@ -195,6 +223,7 @@ def get_max_password_age(iam_client):
         return response['PasswordPolicy']['MaxPasswordAge']
     except ClientError as e:
         print("Unexpected error in get_max_password_age: %s" + e.message)
+
 
 def process_IAMEvent(event, context, iam_client):
     api_call = event['detail']['eventName']
@@ -216,7 +245,8 @@ def process_IAMEvent(event, context, iam_client):
 
 # Add the user to the group that only allows them to reset their password
 def add_user_to_blackhole(username, iam_client):
-    if DISABLE_USERS != "true": return
+    if DISABLE_USERS != "true":
+        return
     global ACTION_SUMMARY
     ACTION_SUMMARY = ACTION_SUMMARY + "\nAdding {} to Blackhole Group".format(username)
     response = iam_client.add_user_to_group(
@@ -227,6 +257,18 @@ def add_user_to_blackhole(username, iam_client):
         handle_error("Adding User to Blackhole Group", username, response['ResponseMetadata'])
     else:
         return 0
+
+
+def force_password_reset(username, iam_client):
+    if DISABLE_USERS != "true":
+        return
+    global ACTION_SUMMARY
+    ACTION_SUMMARY = ACTION_SUMMARY + "\nForcing {} to reset password on next login".format(username)
+    response = iam_client.update_login_profile(UserName=username, PasswordResetRequired=True)
+    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+        handle_error("Forced Password reset for", username, response['ResponseMetadata'])
+    else:
+        return True
 
 
 # Turn off the specified user's key by setting it to inactive.
@@ -255,6 +297,16 @@ def remove_user_from_blackhole(username, iam_client):
         handle_error("Removing User from Blackhole Group", username, response['ResponseMetadata'])
     else:
         return 0
+
+
+def process_mfa_devices(user, iam_client):
+    global REPORT_SUMMARY
+    mfa_response = iam_client.list_mfa_devices(UserName=user)
+    mfa_devices = mfa_response['MFADevices']
+    if len(mfa_devices) == 0:
+        REPORT_SUMMARY = REPORT_SUMMARY + '\n{} has 0 MFA Devices'.format(user)
+        if not is_user_blackholed(user, iam_client):
+            add_user_to_blackhole(user, iam_client)
 
 
 def handle_error(action, username, ResponseMetadata):
